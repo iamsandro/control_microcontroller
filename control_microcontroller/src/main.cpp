@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <Wire.h>
 #include <BH1750.h>
 #include <DHT.h>
@@ -13,7 +14,8 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", -18000, 60000); // UTC-5 (Colombia)
 
 // Definición de la URL del servidor
-#define SERVER_URL "http://localhost:8080/api/greenhouse"
+#define SERVER_URL "http://192.168.100.93:8080/api/greenhouse_readings"
+// #define SERVER_URL "https://fcb7-179-6-24-153.ngrok-free.app/api/greenhouse"
 
 // Configuración de WiFi
 #define WIFI_SSID  "GIGASA 2.4GHZ"
@@ -24,11 +26,11 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", -18000, 60000); // UTC-5 (Colombia)
 #define PIN_FC28_2 33  // GPIO33 como entrada analógica
 #define PIN_FC28_3 35  // GPIO35 como entrada analógica
 #define PIN_CAPACITIVO 34  // GPIO34 como entrada analógica
-#define PIN_RELAY_RIEGO 2
+#define PIN_RELAY_RIEGO 15
 #define PIN_DHT 5  // Cambio de D6 a D5
 #define PIN_RELAY_VENTILADOR 18
 #define PIN_RELAY_LUZ 19
-#define PIN_SENSOR_FLUJO 26
+#define PIN_SENSOR_FLUJO 25
 
 // Definición de sensores
 DHT dht(PIN_DHT, DHT22);
@@ -38,7 +40,7 @@ BH1750 lightMeter;
 #define HUMEDAD_BAJA 45
 #define HUMEDAD_ALTA 80
 #define TEMPERATURA_MAX 25
-#define LUZ_MIN 5000
+#define LUZ_MIN 100
 #define LUZ_MAX 8000
 
 // Rangos de sensores
@@ -53,6 +55,7 @@ unsigned long riegoEndTime = 0;
 bool riegoActivo = false;
 bool enviarRiego = false;
 String riegoId = "";
+float consumoRiego = 0.0; // Consumo de agua durante el riego
 
 // Variables para el ventilador
 unsigned long ventiladorStartTime = 0;
@@ -60,6 +63,12 @@ unsigned long ventiladorEndTime = 0;
 bool ventiladorActivo = false;
 bool enviarVentilador = false;
 String ventiladorId = "";
+
+// Variables para el sensor de flujo
+const float FACTOR_CALIBRACION = 7.5; // Factor de calibración para el sensor YF-S201
+volatile int pulsos = 0; // Contador de pulsos
+unsigned long ultimoTiempoFlujo = 0;
+float flujoLitrosPorMinuto = 0.0;
 
 // Variables para la luz
 unsigned long luzStartTime = 0;
@@ -72,6 +81,11 @@ String luzId = "";
 unsigned long lastCheck = 0;
 unsigned long intervalo = 60000; // Intervalo inicial de 1 min
 
+String generarIdUnico() {
+  // Generar un número aleatorio y convertirlo a String
+  long randNumber = random(1000000000);
+  return String(randNumber);
+}
 
 float leerHumedadPromedio() {
     int humedadFC28_1 = analogRead(PIN_FC28_1);
@@ -96,11 +110,23 @@ float leerHumedadPromedio() {
 
 void controlarHumedad() {
     float humedadSuelo = leerHumedadPromedio();
-    
-    if (humedadSuelo < HUMEDAD_BAJA) {
-        digitalWrite(PIN_RELAY_RIEGO, HIGH);
-    } else if (humedadSuelo > HUMEDAD_ALTA) {
+    Serial.print("Humedad Suelo: "); Serial.print(humedadSuelo); Serial.println("%");
+    if (humedadSuelo < HUMEDAD_BAJA  && !riegoActivo) {
         digitalWrite(PIN_RELAY_RIEGO, LOW);
+
+        riegoStartTime = millis();
+        riegoActivo = true;
+        enviarRiego = true;
+        riegoEndTime = 0;
+        riegoId = generarIdUnico(); // Generar un nuevo ID al inicio
+        consumoRiego = 0.0; // Reiniciar el consumo de agua
+
+    } else if (humedadSuelo > HUMEDAD_ALTA && riegoActivo) {
+        digitalWrite(PIN_RELAY_RIEGO, LOW);
+
+        riegoEndTime = millis();
+        riegoActivo = false;
+        enviarRiego = true;
     }
 }
 
@@ -111,10 +137,21 @@ void controlarTemperatura() {
     Serial.print("Temperatura: "); Serial.print(temperatura); Serial.print("°C | ");
     Serial.print("Humedad Relativa: "); Serial.print(humedadRelativa); Serial.println("%");
 
-    if (temperatura > TEMPERATURA_MAX) {
-        digitalWrite(PIN_RELAY_VENTILADOR, HIGH);
-    } else {
+    if (temperatura > TEMPERATURA_MAX  && !ventiladorActivo) {
         digitalWrite(PIN_RELAY_VENTILADOR, LOW);
+
+        ventiladorStartTime = millis();
+        ventiladorActivo = true;
+        enviarVentilador = true;
+        ventiladorEndTime = 0;
+        ventiladorId = generarIdUnico();
+
+    } else if (temperatura <= TEMPERATURA_MAX && ventiladorActivo) {
+        digitalWrite(PIN_RELAY_VENTILADOR, HIGH);
+
+        ventiladorEndTime = millis();
+        ventiladorActivo = false;
+        enviarVentilador = true;
     }
 }
 
@@ -127,9 +164,20 @@ void controlarIluminacion() {
     int horaActual = timeClient.getHours();
 
     if (luz < LUZ_MIN && horaActual >= 6 && horaActual < 20) {
-        digitalWrite(PIN_RELAY_LUZ, HIGH);
-    } else if ( horaActual < 6 || horaActual >= 20) {
         digitalWrite(PIN_RELAY_LUZ, LOW);
+
+        luzStartTime = millis();
+        luzActiva = true;
+        enviarLuz = true;
+        luzEndTime = 0;
+        luzId = generarIdUnico(); 
+
+    } else if ( horaActual < 6 || horaActual >= 20) {
+        digitalWrite(PIN_RELAY_LUZ, HIGH);
+
+        luzEndTime = millis();
+        luzActiva = false;
+        enviarLuz = true;
     }
 }
 
@@ -144,28 +192,14 @@ void configurarSensorFlujo() {
 }
 
 void medirConsumoAgua() {
-   
-  const float FACTOR_CALIBRACION = 7.5; // Factor de calibración para el sensor YF-S201
-  static volatile int pulsos = 0; // Contador de pulsos
-  static unsigned long ultimoTiempo = 0;
-  float flujoLitrosPorMinuto = 0.0;
-  float consumoLitros = 0.0;
-
-  // Llamar a la configuración del sensor en el setup
-  configurarSensorFlujo();
-
-  // Calcular el flujo y el consumo
-  unsigned long tiempoActual = millis();
-  if (tiempoActual - ultimoTiempo >= 1000) { // Calcular cada segundo
+  if (riegoActivo) {
+    unsigned long tiempoActual = millis();
+    if (tiempoActual - ultimoTiempoFlujo >= 1000) { // Calcular cada segundo
       flujoLitrosPorMinuto = (pulsos / FACTOR_CALIBRACION);
-      consumoLitros += flujoLitrosPorMinuto / 60.0; // Convertir a litros por segundo
-      Serial.print("Flujo: ");
-      Serial.print(flujoLitrosPorMinuto);
-      Serial.print(" L/min | Consumo total: ");
-      Serial.print(consumoLitros);
-      Serial.println(" L");
+      consumoRiego += flujoLitrosPorMinuto / 60.0; // Convertir a litros por segundo
+      ultimoTiempoFlujo = tiempoActual;
       pulsos = 0; // Reiniciar contador de pulsos
-      ultimoTiempo = tiempoActual;
+    }
   }
 }
 
@@ -199,11 +233,7 @@ void enviarDatosHTTP(String jsonString) {
   http.end();
 }
 
-String generarIdUnico() {
-  // Generar un número aleatorio y convertirlo a String
-  long randNumber = random(1000000000);
-  return String(randNumber);
-}
+
 
 
 void setup() {
@@ -227,7 +257,9 @@ while (WiFi.status() != WL_CONNECTED) {
 }
 Serial.println("\nConectado!");
 
-
+  // Sensor de flujo
+  pinMode(PIN_SENSOR_FLUJO, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_SENSOR_FLUJO), contarPulsos, RISING);
 }
 
 void loop() {
@@ -245,12 +277,17 @@ JsonObject sensores = doc.createNestedObject("sensores");
 JsonObject actuadores = doc.createNestedObject("actuadores");
 
 // Datos de sensores
-sensores["humedad"] = dht.readHumidity();
-sensores["temperatura"] = dht.readTemperature();
-sensores["luz"] = lightMeter.readLightLevel();
-sensores["humedad-del-suelo-1"] = map(analogRead(PIN_FC28_1), FC28_SECO, FC28_HUMEDO, 0, 100);
-sensores["humedad-del-suelo-2"] = map(analogRead(PIN_FC28_2), FC28_SECO, FC28_HUMEDO, 0, 100);
-sensores["humedad-del-suelo-3"] = map(analogRead(PIN_FC28_3), FC28_SECO, FC28_HUMEDO, 0, 100);
+sensores["humidity"] = dht.readHumidity();
+sensores["temperature"] = dht.readTemperature();
+sensores["light"] = lightMeter.readLightLevel();
+sensores["status_fan"] = digitalRead(PIN_RELAY_VENTILADOR) == LOW ? "on" : "off";
+sensores["status_light"] = digitalRead(PIN_RELAY_LUZ) == LOW ? "on" : "off";
+sensores["watering_status"] = digitalRead(PIN_RELAY_RIEGO) == LOW ? "on" : "off";
+JsonArray humedadSueloArray = sensores.createNestedArray("soil_humidity");
+humedadSueloArray.add(map(analogRead(PIN_FC28_1), FC28_SECO, FC28_HUMEDO, 0, 100));
+humedadSueloArray.add(map(analogRead(PIN_FC28_2), FC28_SECO, FC28_HUMEDO, 0, 100));
+humedadSueloArray.add(map(analogRead(PIN_FC28_3), FC28_SECO, FC28_HUMEDO, 0, 100));
+
 
 // Iluminación
 if (enviarLuz) {
@@ -272,7 +309,7 @@ if (enviarLuz) {
 // Ventilación
 if (enviarVentilador) {
   JsonObject ventilacion = actuadores.createNestedObject("ventilacion");
-  ventilacion["estado"] = digitalRead(PIN_RELAY_VENTILADOR) == HIGH ? "on" : "off";
+  ventilacion["estado"] = digitalRead(PIN_RELAY_VENTILADOR) == LOW ? "on" : "off";
   if (ventiladorActivo) {
     ventilacion["ventilador_id"] = ventiladorId;
     ventilacion["ventilador_start_time"] = (int)(ventiladorStartTime / 1000);
@@ -289,7 +326,7 @@ if (enviarVentilador) {
 // Riego
 if (enviarRiego) {
   JsonObject riego = actuadores.createNestedObject("riego");
-  riego["estado"] = digitalRead(PIN_RELAY_RIEGO) == HIGH ? "on" : "off";
+  riego["estado"] = digitalRead(PIN_RELAY_RIEGO) == LOW ? "on" : "off";
   if (riegoActivo) {
     riego["riego_id"] = riegoId;
     riego["riego_start_time"] = (int)(riegoStartTime / 1000);
